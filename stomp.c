@@ -1,19 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/select.h>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include <unistd.h>
 #include <netdb.h>
 #include <errno.h>
 #include <pthread.h>
 
-#define MAX_EVENTS (64)
 #define BUFFER_SIZE (10 * 1024 * 1024)
 #define CONNECTED "CONNECTED"
-#define ERROR "ERROR"
 #define MESSAGE "MESSAGE"
 enum status
 {
