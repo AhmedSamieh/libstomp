@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -65,18 +65,11 @@ void *worker_thread_proc(void *handle)
     struct in_addr    *paddr;
     char              *ibuf, *obuf;
     int                err;
-    int                sockfd, epfd, nfds;
+    int                sockfd, nfds;
     struct sockaddr_in sock_addr;
-    struct epoll_event ev = {0}, *events;
-    int                length = 0, buffer_size = BUFFER_SIZE;
+    int                length, buffer_size = BUFFER_SIZE;
+    fd_set             read_fd_set, write_fd_set;
     printf("worker_thread_proc up\n");
-    if ((epfd = epoll_create1(0)) == -1)
-    {
-        printf("epoll_create1() failed - [errno: %d - %s]\n",
-               errno,
-               strerror(errno));
-        exit(EXIT_FAILURE);
-    }
     obuf = (char *)calloc(BUFFER_SIZE, sizeof(char));
     ibuf = (char *)calloc(BUFFER_SIZE, sizeof(char));
     gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
@@ -88,7 +81,6 @@ void *worker_thread_proc(void *handle)
                internal->hostname,
                errno,
                strerror(errno));
-        close(epfd);
         free(ibuf);
         free(obuf);
         exit(EXIT_FAILURE);
@@ -98,25 +90,6 @@ void *worker_thread_proc(void *handle)
         printf("socket() failed - [errno: %d - %s]\n",
                errno,
                strerror(errno));
-        close(epfd);
-        free(ibuf);
-        free(obuf);
-        exit(EXIT_FAILURE);
-    }
-    set_non_blocking(sockfd);
-    ev.data.fd = sockfd;
-    // EPOLLET: Edge Triggered
-    // EPOLLRDHUP: Stream socket peer closed connection, or shut down writing half of connection.
-    // EPOLLIN: The associated file is available for read operations
-    // EPOLLOUT: The associated file is available for write operations.
-    ev.events = EPOLLET | EPOLLRDHUP | EPOLLIN | EPOLLOUT;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev) == -1)
-    {
-        printf("epoll_ctl(EPOLL_CTL_ADD) failed - [errno: %d - %s]\n",
-               errno,
-               strerror(errno));
-        close(sockfd);
-        close(epfd);
         free(ibuf);
         free(obuf);
         exit(EXIT_FAILURE);
@@ -125,58 +98,48 @@ void *worker_thread_proc(void *handle)
     sock_addr.sin_addr.s_addr = paddr->s_addr;
     sock_addr.sin_family = AF_INET;
     sock_addr.sin_port = htons(internal->port);
+    set_non_blocking(sockfd);
     connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
-    events = (struct epoll_event *)calloc(MAX_EVENTS, sizeof(struct epoll_event));
+    length = 0;
     while (internal->status != STATUS_TCP_DISCONNECT)
     {
-        while ((nfds = epoll_wait(epfd, events, MAX_EVENTS, internal->heart_beat << 2)) == -1 && errno == EINTR);
+        struct timeval tv;
+        FD_ZERO(&read_fd_set);
+        FD_SET(sockfd, &read_fd_set);
+        FD_ZERO(&write_fd_set);
+        FD_SET(sockfd, &write_fd_set);
+        tv.tv_sec  = internal->heart_beat / 500;
+        tv.tv_usec = (internal->heart_beat - tv.tv_sec * 500) * 2000;
+        nfds = select(sockfd + 1, &read_fd_set, &write_fd_set, NULL, &tv);
+        if (nfds == -1)
+        {
+            perror ("select");
+            exit (EXIT_FAILURE);
+        }
         if (internal->status != STATUS_TCP_DISCONNECT)
         {
-            int i;
-            if (nfds == -1)
+            if (nfds == 0)
             {
-                printf("epoll_wait() - [errno: %d - %s]\n",
-                       errno,
-                       strerror(errno));
-                free(events);
-                close(sockfd);
-                close(epfd);
-                free(ibuf);
-                free(obuf);
-                exit(EXIT_FAILURE);
-            }
-            else if (nfds == 0)
-            {
-                events[0].data.fd = sockfd;
-                events[0].events = EPOLLRDHUP;
-                nfds = 1;
                 //printf("force reset after time out\n");
+                close(sockfd);
+                internal->status = STATUS_TCP_CONNECT;
+                gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
+                sockfd = socket(AF_INET , SOCK_STREAM , 0);
+                memset(&sock_addr, 0, sizeof(struct sockaddr_in));
+                sock_addr.sin_addr.s_addr = paddr->s_addr;
+                sock_addr.sin_family = AF_INET;
+                sock_addr.sin_port = htons(internal->port);
+                set_non_blocking(sockfd);
+                connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
+                length = 0;
             }
-            for (i = 0; i < nfds; i++)
+            else
             {
-                if (events[i].events & EPOLLRDHUP)
-                {
-                    close(events[i].data.fd);
-                    internal->status = STATUS_TCP_CONNECT;
-                    usleep(internal->heart_beat * 1000);
-                    gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
-                    sockfd = socket(AF_INET , SOCK_STREAM , 0);
-                    set_non_blocking(sockfd);
-                    ev.data.fd = sockfd;
-                    ev.events = EPOLLET | EPOLLRDHUP | EPOLLIN | EPOLLOUT;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);
-                    memset(&sock_addr, 0, sizeof(struct sockaddr_in));
-                    sock_addr.sin_addr.s_addr = paddr->s_addr;
-                    sock_addr.sin_family = AF_INET;
-                    sock_addr.sin_port = htons(internal->port);
-                    connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
-                    length = 0;
-                }
-                else if (events[i].events & EPOLLIN)
+                if (FD_ISSET(sockfd, &read_fd_set))
                 {
                     while (1)
                     {
-                        int n = recv(events[i].data.fd, ibuf + length, buffer_size - 1 - length, 0);
+                        int n = recv(sockfd, ibuf + length, buffer_size - 1 - length, 0);
                         if (n > 0)
                         {
                             int   i;
@@ -204,7 +167,7 @@ void *worker_thread_proc(void *handle)
                                 if (strncmp(ibuf, CONNECTED, sizeof(CONNECTED) - 1) == 0)
                                 {
                                     internal->status = STATUS_STOMP_SUBSCRIBE;
-                                    send_all(events[i].data.fd,
+                                    send_all(sockfd,
                                              obuf,
                                              sprintf(obuf,
                                                      "SUBSCRIBE\n"\
@@ -227,7 +190,7 @@ void *worker_thread_proc(void *handle)
                                     ptr = strstr(ptr + 1, "\n\n") + 2;
                                     if (internal->message_handler_cb(ptr))
                                     {
-                                        send_all(events[i].data.fd,
+                                        send_all(sockfd,
                                                  obuf,
                                                  sprintf(obuf,
                                                          "ACK\n"\
@@ -242,18 +205,15 @@ void *worker_thread_proc(void *handle)
                                     }
                                     else
                                     {
-                                        close(events[i].data.fd);
+                                        close(sockfd);
                                         internal->status = STATUS_TCP_CONNECT;
                                         gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
                                         sockfd = socket(AF_INET , SOCK_STREAM , 0);
-                                        set_non_blocking(sockfd);
-                                        ev.data.fd = sockfd;
-                                        ev.events = EPOLLET | EPOLLRDHUP | EPOLLIN | EPOLLOUT;
-                                        epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);
                                         memset(&sock_addr, 0, sizeof(struct sockaddr_in));
                                         sock_addr.sin_addr.s_addr = paddr->s_addr;
                                         sock_addr.sin_family = AF_INET;
                                         sock_addr.sin_port = htons(internal->port);
+                                        set_non_blocking(sockfd);
                                         connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                                         length = 0;
                                         break;
@@ -281,18 +241,35 @@ void *worker_thread_proc(void *handle)
                                 memmove(ibuf, ibuf + i, length);
                             }
                         }
+                        else if (n == 0)
+                        {
+                            //printf("socket closed - reconnect\n");
+                            close(sockfd);
+                            internal->status = STATUS_TCP_CONNECT;
+                            usleep(internal->heart_beat * 1000);
+                            gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
+                            sockfd = socket(AF_INET , SOCK_STREAM , 0);
+                            memset(&sock_addr, 0, sizeof(struct sockaddr_in));
+                            sock_addr.sin_addr.s_addr = paddr->s_addr;
+                            sock_addr.sin_family = AF_INET;
+                            sock_addr.sin_port = htons(internal->port);
+                            set_non_blocking(sockfd);
+                            connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
+                            length = 0;
+                            break;
+                        }
                         else if (errno == EAGAIN || errno == EWOULDBLOCK)
                         {
                             break;
                         }
                     }
                 }
-                else if (events[i].events & EPOLLOUT)
+                if (FD_ISSET(sockfd, &write_fd_set))
                 {
                     if (internal->status == STATUS_TCP_CONNECT)
                     {
                         internal->status = STATUS_STOMP_CONNECT;
-                        send_all(events[i].data.fd,
+                        send_all(sockfd,
                                  obuf,
                                  sprintf(obuf,
                                          "STOMP\naccept-version:1.1\nreceipt:stomp-%d\nheart-beat:0,%u\n\n%c\n",
@@ -306,9 +283,7 @@ void *worker_thread_proc(void *handle)
             }
         }
     }
-    free(events);
     close(sockfd);
-    close(epfd);
     free(ibuf);
     free(obuf);
     printf("worker_thread_proc down\n");
