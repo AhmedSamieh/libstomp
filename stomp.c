@@ -97,15 +97,15 @@ void *worker_thread_proc(void *handle)
     set_non_blocking(sockfd);
     connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
     length = 0;
+    FD_ZERO(&read_fd_set);
+    FD_ZERO(&write_fd_set);
+    FD_SET(sockfd, &write_fd_set);
     while (internal->status != STATUS_TCP_DISCONNECT)
     {
         struct timeval tv;
-        FD_ZERO(&read_fd_set);
-        FD_SET(sockfd, &read_fd_set);
-        FD_ZERO(&write_fd_set);
-        FD_SET(sockfd, &write_fd_set);
-        tv.tv_sec  = internal->heart_beat / 500;
-        tv.tv_usec = (internal->heart_beat - tv.tv_sec * 500) * 2000;
+        tv.tv_sec  = internal->heart_beat >> 8;
+        tv.tv_usec = (internal->heart_beat & 0xff) << 12;
+        //printf("tv.tv_sec = %lu, tv.tv_usec = %lu\n", tv.tv_sec, tv.tv_usec);
         nfds = select(sockfd + 1, &read_fd_set, &write_fd_set, NULL, &tv);
         if (nfds == -1)
         {
@@ -128,11 +128,14 @@ void *worker_thread_proc(void *handle)
                 set_non_blocking(sockfd);
                 connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                 length = 0;
+                FD_ZERO(&read_fd_set);
+                FD_SET(sockfd, &write_fd_set);
             }
             else
             {
                 if (FD_ISSET(sockfd, &read_fd_set))
                 {
+                    //printf("FD_ISSET(sockfd, &read_fd_set)\n");
                     while (1)
                     {
                         int n = recv(sockfd, ibuf + length, buffer_size - 1 - length, 0);
@@ -212,6 +215,8 @@ void *worker_thread_proc(void *handle)
                                         set_non_blocking(sockfd);
                                         connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                                         length = 0;
+                                        FD_ZERO(&read_fd_set);
+                                        FD_SET(sockfd, &write_fd_set);
                                         break;
                                     }
                                 }
@@ -222,6 +227,8 @@ void *worker_thread_proc(void *handle)
                                 }
                                 else
                                 {
+                                    FD_SET(sockfd, &read_fd_set);
+                                    FD_ZERO(&write_fd_set);
                                     break;
                                 }
                             }
@@ -229,6 +236,8 @@ void *worker_thread_proc(void *handle)
                             {
                                 if (ibuf[i] != '\n')
                                 {
+                                    FD_SET(sockfd, &read_fd_set);
+                                    FD_ZERO(&write_fd_set);
                                     break;
                                 }
                             }
@@ -252,16 +261,21 @@ void *worker_thread_proc(void *handle)
                             set_non_blocking(sockfd);
                             connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                             length = 0;
+                            FD_ZERO(&read_fd_set);
+                            FD_SET(sockfd, &write_fd_set);
                             break;
                         }
                         else if (errno == EAGAIN || errno == EWOULDBLOCK)
                         {
+                            FD_SET(sockfd, &read_fd_set);
+                            FD_ZERO(&write_fd_set);
                             break;
                         }
                     }
                 }
                 if (FD_ISSET(sockfd, &write_fd_set))
                 {
+                    //printf("FD_ISSET(sockfd, &write_fd_set)\n");
                     if (internal->status == STATUS_TCP_CONNECT)
                     {
                         internal->status = STATUS_STOMP_CONNECT;
@@ -275,6 +289,8 @@ void *worker_thread_proc(void *handle)
                                  MSG_NOSIGNAL);
                         //printf("oFrame: '%s'\n", obuf);
                     }
+                    FD_SET(sockfd, &read_fd_set);
+                    FD_ZERO(&write_fd_set);
                 }
             }
         }
