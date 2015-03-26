@@ -130,7 +130,7 @@ void *worker_thread_proc(void *handle)
                 set_non_blocking(sockfd);
                 connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                 length = 0;
-                FD_ZERO(&next_read_fd_set);
+                FD_CLR(sockfd, &next_read_fd_set);
                 FD_SET(sockfd, &next_write_fd_set);
             }
             else if (FD_ISSET(sockfd, &write_fd_set))
@@ -150,7 +150,7 @@ void *worker_thread_proc(void *handle)
                     //printf("oFrame: '%s'\n", obuf);
                 }
                 FD_SET(sockfd, &next_read_fd_set);
-                FD_ZERO(&next_write_fd_set);
+                FD_CLR(sockfd, &next_write_fd_set);
             }
             else if (FD_ISSET(sockfd, &read_fd_set))
             {
@@ -235,7 +235,7 @@ void *worker_thread_proc(void *handle)
                                     set_non_blocking(sockfd);
                                     connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                                     length = 0;
-                                    FD_ZERO(&next_read_fd_set);
+                                    FD_CLR(sockfd, &next_read_fd_set);
                                     FD_SET(sockfd, &next_write_fd_set);
                                     break;
                                 }
@@ -277,7 +277,7 @@ void *worker_thread_proc(void *handle)
                         set_non_blocking(sockfd);
                         connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
                         length = 0;
-                        FD_ZERO(&next_read_fd_set);
+                        FD_CLR(sockfd, &next_read_fd_set);
                         FD_SET(sockfd, &next_write_fd_set);
                         break;
                     }
