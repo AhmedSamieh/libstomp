@@ -8,7 +8,7 @@
 #include <errno.h>
 #include <pthread.h>
 
-#define BUFFER_SIZE (10 * 1024 * 1024)
+#define DEFAULT_BUFFER_SIZE (1024)
 #define CONNECTED "CONNECTED"
 #define MESSAGE "MESSAGE"
 enum status
@@ -28,6 +28,9 @@ struct stomp_internal_struct
     pthread_t       threadid;
     int             status;
     int             receipt;
+    int             ibuf_size;
+    char           *ibuf;
+    char           *obuf;
 };
 int send_all(int         sockfd,
              const char *buf,
@@ -59,17 +62,14 @@ void *worker_thread_proc(void *handle)
     struct stomp_internal_struct *internal = (struct stomp_internal_struct *)handle;
     struct hostent     hostbuf, *host;
     struct in_addr    *paddr;
-    char              *ibuf, *obuf;
     int                err;
     int                sockfd, nfds;
     struct sockaddr_in sock_addr;
-    int                length, buffer_size = BUFFER_SIZE;
+    int                length;
     fd_set             read_fd_set, write_fd_set;
     fd_set             next_read_fd_set, next_write_fd_set;
     printf("worker_thread_proc up\n");
-    obuf = (char *)calloc(BUFFER_SIZE, sizeof(char));
-    ibuf = (char *)calloc(BUFFER_SIZE, sizeof(char));
-    gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
+    gethostbyname_r(internal->hostname, &hostbuf, internal->ibuf, internal->ibuf_size, &host, &err);
     if (host == NULL ||
         host->h_addr_list == NULL ||
         (paddr = (struct in_addr *)host->h_addr_list[0]) == NULL)
@@ -78,8 +78,6 @@ void *worker_thread_proc(void *handle)
                internal->hostname,
                errno,
                strerror(errno));
-        free(ibuf);
-        free(obuf);
         exit(EXIT_FAILURE);
     }
     if ((sockfd = socket(AF_INET , SOCK_STREAM , 0)) == -1)
@@ -87,8 +85,6 @@ void *worker_thread_proc(void *handle)
         printf("socket() failed - [errno: %d - %s]\n",
                errno,
                strerror(errno));
-        free(ibuf);
-        free(obuf);
         exit(EXIT_FAILURE);
     }
     memset(&sock_addr, 0, sizeof(struct sockaddr_in));
@@ -121,7 +117,7 @@ void *worker_thread_proc(void *handle)
                 printf("force reset after time out\n");
                 close(sockfd);
                 internal->status = STATUS_TCP_CONNECT;
-                gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
+                gethostbyname_r(internal->hostname, &hostbuf, internal->ibuf, internal->ibuf_size, &host, &err);
                 sockfd = socket(AF_INET , SOCK_STREAM , 0);
                 memset(&sock_addr, 0, sizeof(struct sockaddr_in));
                 sock_addr.sin_addr.s_addr = paddr->s_addr;
@@ -140,14 +136,14 @@ void *worker_thread_proc(void *handle)
                 {
                     internal->status = STATUS_STOMP_CONNECT;
                     send_all(sockfd,
-                             obuf,
-                             sprintf(obuf,
+                             internal->obuf,
+                             sprintf(internal->obuf,
                                      "STOMP\naccept-version:1.1\nreceipt:stomp-%d\nheart-beat:0,%u\n\n%c\n",
                                      internal->receipt++,
                                      internal->heart_beat,
                                      '\0'),
                              MSG_NOSIGNAL);
-                    //printf("oFrame: '%s'\n", obuf);
+                    //printf("oFrame: '%s'\n", internal->obuf);
                 }
                 FD_SET(sockfd, &next_read_fd_set);
                 FD_CLR(sockfd, &next_write_fd_set);
@@ -157,7 +153,7 @@ void *worker_thread_proc(void *handle)
                 //printf("FD_ISSET(sockfd, &read_fd_set)\n");
                 while (1)
                 {
-                    int n = recv(sockfd, ibuf + length, buffer_size - 1 - length, 0);
+                    int n = recv(sockfd, internal->ibuf + length, internal->ibuf_size - length, 0);
                     if (n > 0)
                     {
                         int   i;
@@ -165,7 +161,7 @@ void *worker_thread_proc(void *handle)
                         length += n;
                         for (i = 0; i < length; i++)
                         {
-                            if (ibuf[i] != '\n')
+                            if (internal->ibuf[i] != '\n')
                             {
                                 break;
                             }
@@ -175,91 +171,100 @@ void *worker_thread_proc(void *handle)
                             //printf("heart-beat\n");
                             if ((length -= i) > 0)
                             {
-                                memmove(ibuf, ibuf + i, length);
+                                memmove(internal->ibuf, internal->ibuf + i, length);
                             }
                         }
-                        while ((pch = (char *) memchr(ibuf, '\0', length)) != NULL) // end with '\0' + '\n'
+                        if (length > 0)
                         {
-                            //printf("iFrame: '%s'\n", ibuf);
-                            size_t frame_length = (pch + 2) - ibuf;
-                            if (strncmp(ibuf, CONNECTED, sizeof(CONNECTED) - 1) == 0)
+                            while ((pch = (char *) memchr(internal->ibuf, '\0', length)) != NULL) // end with '\0' + '\n'
                             {
-                                internal->status = STATUS_STOMP_SUBSCRIBE;
-                                send_all(sockfd,
-                                         obuf,
-                                         sprintf(obuf,
-                                                 "SUBSCRIBE\n"\
-                                                 "id:0\n"\
-                                                 "destination:/queue/%s\n"\
-                                                 "ack:client\n"\
-                                                 "activemq.prefetchSize:10\n"\
-                                                 "\n"\
-                                                 "%c\n",
-                                                 internal->queuename,
-                                                 '\0') + 1,
-                                         0);
-                                //printf("oFrame: '%s'\n", obuf);
-                            }
-                            else if (strncmp(ibuf, MESSAGE, sizeof(MESSAGE) - 1) == 0)
-                            {
-                                char *message_id = strstr(ibuf, "message-id:") + 11;
-                                char *ptr = strstr(message_id, "\n");
-                                *ptr = '\0';
-                                ptr = strstr(ptr + 1, "\n\n") + 2;
-                                if (internal->message_handler_cb(ptr))
+                                //printf("iFrame: '%s'\n", internal->ibuf);
+                                size_t frame_length = (pch + 2) - internal->ibuf;
+                                if (strncmp(internal->ibuf, CONNECTED, sizeof(CONNECTED) - 1) == 0)
                                 {
+                                    internal->status = STATUS_STOMP_SUBSCRIBE;
                                     send_all(sockfd,
-                                             obuf,
-                                             sprintf(obuf,
-                                                     "ACK\n"\
-                                                     "message-id:%s\n"\
-                                                     "subscription:0\n"\
+                                             internal->obuf,
+                                             sprintf(internal->obuf,
+                                                     "SUBSCRIBE\n"\
+                                                     "id:0\n"\
+                                                     "ack:client\n"\
+                                                     "activemq.prefetchSize:10\n"\
+                                                     "destination:/queue/%s\n"\
                                                      "\n"\
                                                      "%c\n",
-                                                     message_id,
+                                                     internal->queuename,
                                                      '\0') + 1,
-                                             MSG_NOSIGNAL);
-                                    //printf("oFrame: '%s'\n", obuf);
+                                             0);
+                                    //printf("oFrame: '%s'\n", internal->obuf);
+                                }
+                                else if (strncmp(internal->ibuf, MESSAGE, sizeof(MESSAGE) - 1) == 0)
+                                {
+                                    char *message_id = strstr(internal->ibuf + sizeof(MESSAGE), "message-id:") + 11;
+                                    char *ptr = strstr(message_id, "\n");
+                                    *ptr = '\0';
+                                    ptr = strstr(ptr + 1, "\n\n") + 2;
+                                    if (internal->message_handler_cb(ptr))
+                                    {
+                                        send_all(sockfd,
+                                                 internal->obuf,
+                                                 sprintf(internal->obuf,
+                                                         "ACK\n"\
+                                                         "subscription:0\n"\
+                                                         "message-id:%s\n"\
+                                                         "\n"\
+                                                         "%c\n",
+                                                         message_id,
+                                                         '\0') + 1,
+                                                 MSG_NOSIGNAL);
+                                        //printf("oFrame: '%s'\n", internal->obuf);
+                                    }
+                                    else
+                                    {
+                                        //printf("rejected - reconnect\n");
+                                        close(sockfd);
+                                        internal->status = STATUS_TCP_CONNECT;
+                                        gethostbyname_r(internal->hostname, &hostbuf, internal->ibuf, internal->ibuf_size, &host, &err);
+                                        sockfd = socket(AF_INET , SOCK_STREAM , 0);
+                                        memset(&sock_addr, 0, sizeof(struct sockaddr_in));
+                                        sock_addr.sin_addr.s_addr = paddr->s_addr;
+                                        sock_addr.sin_family = AF_INET;
+                                        sock_addr.sin_port = htons(internal->port);
+                                        set_non_blocking(sockfd);
+                                        connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
+                                        length = 0;
+                                        FD_CLR(sockfd, &next_read_fd_set);
+                                        FD_SET(sockfd, &next_write_fd_set);
+                                        break;
+                                    }
+                                }
+                                length -= frame_length;
+                                if (length > 0)
+                                {
+                                    memmove(internal->ibuf, (pch + 2), length);
                                 }
                                 else
                                 {
-                                    //printf("rejected - reconnect\n");
-                                    close(sockfd);
-                                    internal->status = STATUS_TCP_CONNECT;
-                                    gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
-                                    sockfd = socket(AF_INET , SOCK_STREAM , 0);
-                                    memset(&sock_addr, 0, sizeof(struct sockaddr_in));
-                                    sock_addr.sin_addr.s_addr = paddr->s_addr;
-                                    sock_addr.sin_family = AF_INET;
-                                    sock_addr.sin_port = htons(internal->port);
-                                    set_non_blocking(sockfd);
-                                    connect(sockfd, (struct sockaddr *)&sock_addr, sizeof(struct sockaddr_in));
-                                    length = 0;
-                                    FD_CLR(sockfd, &next_read_fd_set);
-                                    FD_SET(sockfd, &next_write_fd_set);
                                     break;
                                 }
-                            }
-                            length -= frame_length;
-                            if (length > 0)
-                            {
-                                memmove(ibuf, (pch + 2), length);
-                            }
-                            else
-                            {
-                                break;
                             }
                         }
                         for (i = 0; i < length; i++)
                         {
-                            if (ibuf[i] != '\n')
+                            if (internal->ibuf[i] != '\n')
                             {
                                 break;
                             }
                         }
                         if (i > 0 && (length -= i) > 0)
                         {
-                            memmove(ibuf, ibuf + i, length);
+                            memmove(internal->ibuf, internal->ibuf + i, length);
+                        }
+                        if (length == internal->ibuf_size)
+                        {
+                            internal->ibuf_size <<= 1;
+                            internal->ibuf = (char *)realloc(internal->ibuf, internal->ibuf_size);
+                            printf("resize the ibuf to %d\n", internal->ibuf_size);
                         }
                     }
                     else if (n == 0)
@@ -268,7 +273,7 @@ void *worker_thread_proc(void *handle)
                         close(sockfd);
                         internal->status = STATUS_TCP_CONNECT;
                         usleep(internal->heart_beat * 1000);
-                        gethostbyname_r(internal->hostname, &hostbuf, ibuf, buffer_size, &host, &err);
+                        gethostbyname_r(internal->hostname, &hostbuf, internal->ibuf, internal->ibuf_size, &host, &err);
                         sockfd = socket(AF_INET , SOCK_STREAM , 0);
                         memset(&sock_addr, 0, sizeof(struct sockaddr_in));
                         sock_addr.sin_addr.s_addr = paddr->s_addr;
@@ -290,8 +295,6 @@ void *worker_thread_proc(void *handle)
         }
     }
     close(sockfd);
-    free(ibuf);
-    free(obuf);
     printf("worker_thread_proc down\n");
     pthread_exit(0);
     return NULL;
@@ -310,6 +313,9 @@ void *stomp_create_consumer(const char     *hostname,
     internal->heart_beat         = heart_beat;
     internal->receipt            = 0;
     internal->status             = STATUS_TCP_CONNECT;
+    internal->ibuf_size          = DEFAULT_BUFFER_SIZE;
+    internal->ibuf               = (char *)malloc(DEFAULT_BUFFER_SIZE);
+    internal->obuf               = (char *)malloc(DEFAULT_BUFFER_SIZE);
     pthread_create(&(internal->threadid), NULL, worker_thread_proc, internal);
     return internal;
 }
@@ -318,6 +324,8 @@ void stomp_relase(void *handle)
     struct stomp_internal_struct *internal = (struct stomp_internal_struct *) handle;
     internal->status = STATUS_TCP_DISCONNECT;
     pthread_join(internal->threadid, NULL);
+    free(internal->obuf);
+    free(internal->ibuf);
     free(internal->queuename);
     free(internal->hostname);
     free(internal);
