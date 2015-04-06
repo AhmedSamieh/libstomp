@@ -194,8 +194,8 @@ void *worker_thread_proc(void *handle)
                                                      "\n"\
                                                      "%c\n",
                                                      internal->queuename,
-                                                     '\0') + 1,
-                                             0);
+                                                     '\0'),
+                                             MSG_NOSIGNAL);
                                     //printf("oFrame: '%s'\n", internal->obuf);
                                 }
                                 else if (strncmp(internal->ibuf, MESSAGE, sizeof(MESSAGE) - 1) == 0)
@@ -215,7 +215,7 @@ void *worker_thread_proc(void *handle)
                                                          "\n"\
                                                          "%c\n",
                                                          message_id,
-                                                         '\0') + 1,
+                                                         '\0'),
                                                  MSG_NOSIGNAL);
                                         //printf("oFrame: '%s'\n", internal->obuf);
                                     }
